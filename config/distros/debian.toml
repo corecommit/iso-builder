@@ -1,0 +1,3 @@
+id = "debian"
+name = "Debian/Ubuntu"
+package_manager_binary = "apt-get"

@@ -1,2 +1,7 @@
 /target
 prompt.txt
+
+# Local ISO work data
+.work/
+*.iso
+*.iso.sha256

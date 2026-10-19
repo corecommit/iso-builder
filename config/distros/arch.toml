@@ -1,0 +1,3 @@
+id = "arch"
+name = "CachyOS/Arch"
+package_manager_binary = "pacman"
