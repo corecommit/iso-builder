@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -115,7 +116,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// "1 ISO" / "3 ISOs" — the unit used in scan report lines.
+/// "1 ISO" / "3 ISOs" - the unit used in scan report lines.
 fn iso_count_unit(count: usize) -> &'static str {
     if count == 1 {
         "ISO"
@@ -152,8 +153,8 @@ fn home_subdir(home: &Option<PathBuf>, suffix: &str) -> Option<PathBuf> {
 
 /// Default folders that may contain `.iso` files, chosen from
 /// `std::env::consts::OS`. The home directory is always included directly
-/// (not just its subfolders) so an ISO sitting in `~` — or in `/root` when
-/// running as root — is found.
+/// (not just its subfolders) so an ISO sitting in `~` - or in `/root` when
+/// running as root - is found.
 fn get_search_paths() -> Vec<PathBuf> {
     let home = home_dir();
     let mut paths = Vec::new();
@@ -216,9 +217,9 @@ fn should_skip_dir(path: &Path) -> bool {
     name.starts_with('.') || SKIPPED_DIRS.contains(&name)
 }
 
-/// Every `.iso` file in the default folders — with its size — plus a
+/// Every `.iso` file in the default folders - with its size - plus a
 /// per-folder debug line such as `"/root (1 ISO)"` or
-/// `"⚠ Permission denied: /media"`.
+/// `"[WARN] Permission denied: /media"`.
 fn discover_isos() -> (Vec<IsoEntry>, Vec<String>) {
     let mut isos: Vec<IsoEntry> = Vec::new();
     let mut debug = Vec::new();
@@ -244,10 +245,10 @@ fn discover_isos() -> (Vec<IsoEntry>, Vec<String>) {
                 ));
             }
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                debug.push(format!("⚠ Permission denied: {}", root.display()));
+                debug.push(format!("[WARN] Permission denied: {}", root.display()));
             }
             Err(err) => {
-                debug.push(format!("⚠ Could not read {}: {}", root.display(), err));
+                debug.push(format!("[WARN] Could not read {}: {}", root.display(), err));
             }
         }
 
@@ -342,7 +343,7 @@ fn is_deep_scan_pruned(name: &str) -> bool {
     }
 }
 
-/// `(device, inode)` — identifies the physical file behind a path, so the
+/// `(device, inode)` - identifies the physical file behind a path, so the
 /// same ISO seen through several mounts (e.g. `/sdcard` and `/mnt/sdcard`) is
 /// listed only once. `None` on platforms without inode semantics.
 #[cfg(unix)]
@@ -416,6 +417,362 @@ fn deep_scan_worker(cancel: &AtomicBool) -> Vec<IsoEntry> {
 }
 
 // ---------------------------------------------------------------------------
+// Extraction workspace and native detection
+// ---------------------------------------------------------------------------
+
+/// Root for the per-ISO workspaces: `./iso-builder-work/<name-without-ext>/`.
+/// The TUI extracts each ISO here (outer ISO + SquashFS) and then detects
+/// everything by reading the extracted files; the generated script reuses
+/// the same folder when it is still around.
+const WORK_ROOT: &str = "./iso-builder-work";
+
+/// Shown while the extraction runs.
+const EXTRACTING_MESSAGE: &str = "Extracting ISO... This may take a few minutes.";
+
+/// Shown when [Enter] is pressed again while an extraction is already busy.
+const EXTRACTION_RUNNING: &str = "Extraction is already running, please wait...";
+
+/// Everything the TUI learns while preparing an ISO.
+struct IsoPrep {
+    /// `./iso-builder-work/<filename without extension>`.
+    work_dir: String,
+    /// From `etc/os-release` in the extracted rootfs, e.g. "CachyOS Linux".
+    distro: String,
+    /// Binary found in the rootfs (`pacman`, `apt`, ...) or "Unknown".
+    pkg_mgr: String,
+    /// Desktop session file found in the rootfs or "Unknown".
+    desktop: String,
+}
+
+/// Workspace path for an ISO: `./iso-builder-work/<filename without ext>/`.
+fn work_dir_for(iso_path: &str) -> String {
+    let stem = Path::new(iso_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("image");
+    format!("{}/{}", WORK_ROOT, stem)
+}
+
+/// Prepares `iso_path` for the wizard: extracts it into the cached workspace
+/// (unless a previous extraction is already there) and then reads the
+/// extracted rootfs with plain `std::fs` calls - no `grep`, no external
+/// detector, no second archive pass.
+fn prepare_iso(iso_path: &str) -> Result<IsoPrep, String> {
+    let work_dir = work_dir_for(iso_path);
+    let iso_root = format!("{}/iso-root", work_dir);
+    let rootfs = format!("{}/rootfs", work_dir);
+
+    if cache_is_ready(&rootfs) {
+        // Extracted on a previous run: skip straight to detection.
+    } else {
+        // Fresh extraction: the outer ISO with xorriso (7z as fallback),
+        // then the SquashFS rootfs. This is the slow part.
+        let _ = fs::remove_dir_all(&iso_root);
+        fs::create_dir_all(&iso_root)
+            .map_err(|err| format!("could not create {}: {}", iso_root, err))?;
+        fs::create_dir_all(&rootfs)
+            .map_err(|err| format!("could not create {}: {}", rootfs, err))?;
+
+        let squashfs = extract_iso(iso_path, &iso_root)?;
+        extract_squashfs(&squashfs, &rootfs)?;
+    }
+
+    let mut distro = distro_name_from(&rootfs);
+    if distro.is_empty() {
+        distro = "Unknown".to_string();
+    }
+    Ok(IsoPrep {
+        work_dir,
+        distro,
+        pkg_mgr: package_manager_in(&rootfs).unwrap_or("Unknown").to_string(),
+        desktop: desktop_environment_in(&rootfs).unwrap_or("Unknown").to_string(),
+    })
+}
+
+/// True when `rootfs/` already holds a finished extraction. An empty folder
+/// (e.g. left behind by a run that was cancelled mid-extract) does not
+/// count, so the caller re-extracts instead of detecting nothing.
+fn cache_is_ready(rootfs: &str) -> bool {
+    fs::read_dir(rootfs)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// PID of the extraction tool currently running, so the exit/panic cleanup
+/// can stop it before deleting the workspace. 0 = nothing running.
+static EXTRACTION_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Runs a tool with its output captured (never on the TUI's terminal) and
+/// remembers its pid while it runs.
+fn run_captured(command: &mut Command) -> io::Result<Output> {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    EXTRACTION_PID.store(child.id(), Ordering::Relaxed);
+    let output = child.wait_with_output();
+    EXTRACTION_PID.store(0, Ordering::Relaxed);
+    output
+}
+
+/// Stops an extraction tool that may still be writing (otherwise the child
+/// would keep writing into the folder after iso-builder already exited).
+/// Best effort only; a 150 ms pause lets the process release its files.
+fn stop_active_extraction() {
+    let pid = EXTRACTION_PID.swap(0, Ordering::Relaxed);
+    if pid == 0 {
+        return;
+    }
+    let _ = Command::new("sh")
+        .args(["-c", &format!("kill {} 2>/dev/null || true", pid)])
+        .status();
+    thread::sleep(Duration::from_millis(150));
+}
+
+/// Extracts the outer ISO into `iso_root` with `xorriso`, falling back to
+/// `7z`, and returns the path of the largest `.sfs`/`.squashfs` inside it -
+/// that is the installer rootfs (Ubuntu ships 20+ small variants next to
+/// the real one, so "first match" is not good enough).
+fn extract_iso(iso_path: &str, iso_root: &str) -> Result<String, String> {
+    let xorriso = run_captured(
+        Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev", iso_path, "-extract", "/", iso_root]),
+    );
+    let xorriso_error = match &xorriso {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(command_error("xorriso", output)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Some("xorriso is not installed".to_string())
+        }
+        Err(err) => Some(format!("could not run xorriso: {}", err)),
+    };
+
+    if let Some(primary_error) = xorriso_error {
+        // Restart the fallback from a clean folder so xorriso leftovers
+        // cannot mix with the 7z extraction.
+        let _ = fs::remove_dir_all(iso_root);
+        fs::create_dir_all(iso_root)
+            .map_err(|err| format!("could not create {}: {}", iso_root, err))?;
+
+        let output_arg = format!("-o{}", iso_root);
+        match run_captured(Command::new("7z").args(["x", "-y", iso_path, output_arg.as_str()])) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                return Err(format!(
+                    "{}; {}",
+                    primary_error,
+                    command_error("7z", &output)
+                ));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "{} and 7z is not installed (install xorriso or p7zip-full)",
+                    primary_error
+                ));
+            }
+            Err(err) => return Err(format!("{}; could not run 7z: {}", primary_error, err)),
+        }
+    }
+
+    find_squashfs_image(iso_root)
+        .map(|(path, _size)| path)
+        .ok_or_else(|| "no .sfs or .squashfs image was found inside the ISO".to_string())
+}
+
+/// Extracts the SquashFS rootfs. `-f` overwrites leftovers from an earlier
+/// attempt; the destination folder itself may already exist.
+fn extract_squashfs(squashfs: &str, rootfs: &str) -> Result<(), String> {
+    let output = run_captured(Command::new("unsquashfs").args(["-f", "-d", rootfs, squashfs]))
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                "unsquashfs is not installed (install squashfs-tools)".to_string()
+            } else {
+                format!("could not run unsquashfs: {}", err)
+            }
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error("unsquashfs", &output))
+    }
+}
+
+/// Largest `.sfs`/`.squashfs` file under `iso_root`.
+fn find_squashfs_image(iso_root: &str) -> Option<(String, u64)> {
+    let mut best: Option<(String, u64)> = None;
+    for entry in WalkDir::new(iso_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !(name.ends_with(".sfs") || name.ends_with(".squashfs")) {
+            continue;
+        }
+        let size = entry.metadata().map(|data| data.len()).unwrap_or(0);
+        if best.as_ref().map_or(true, |(_, best_size)| size > *best_size) {
+            best = Some((entry.path().to_string_lossy().into_owned(), size));
+        }
+    }
+    best
+}
+
+/// Distro name for the review screen, read from `etc/os-release`.
+/// `PRETTY_NAME` wins over `NAME`; values may be double- or single-quoted.
+fn distro_name_from(rootfs: &str) -> String {
+    let Ok(contents) = fs::read_to_string(Path::new(rootfs).join("etc/os-release")) else {
+        return String::new();
+    };
+    let mut name = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        match key.trim() {
+            "PRETTY_NAME" => return value,
+            "NAME" => name = Some(value),
+            _ => {}
+        }
+    }
+    name.unwrap_or_default()
+}
+
+/// Package manager binaries, checked in a fixed order (a rootfs only ever
+/// has one of them). `apt` (not `apt-get`) keeps this list matching the
+/// generated script's rootfs probe.
+const PKG_MGR_BINARIES: &[(&str, &str)] = &[
+    ("usr/bin/pacman", "pacman"),
+    ("usr/bin/apt", "apt"),
+    ("usr/bin/dnf", "dnf"),
+    ("usr/bin/zypper", "zypper"),
+    ("usr/bin/xbps-install", "xbps"),
+    ("usr/bin/emerge", "emerge"),
+    ("sbin/apk", "apk"),
+];
+
+/// Package manager whose binary exists in the rootfs.
+fn package_manager_in(rootfs: &str) -> Option<&'static str> {
+    PKG_MGR_BINARIES
+        .iter()
+        .find(|(relative, _)| Path::new(rootfs).join(relative).is_file())
+        .map(|(_, name)| *name)
+}
+
+/// Desktop session files that map to a desktop environment. `plasma.desktop`
+/// (Plasma 6) and `ubuntu.desktop` (Ubuntu's GNOME session) are not in the
+/// task sketch's list but are what current releases actually ship.
+const DE_SESSION_FILES: &[(&str, &str)] = &[
+    ("hyprland.desktop", "Hyprland"),
+    ("plasmawayland.desktop", "KDE Plasma"),
+    ("plasma.desktop", "KDE Plasma"),
+    ("gnome.desktop", "GNOME"),
+    ("ubuntu.desktop", "GNOME"),
+    ("xfce.desktop", "XFCE"),
+    ("sway.desktop", "Sway"),
+];
+
+/// Desktop environment found by listing the extracted session folders.
+fn desktop_environment_in(rootfs: &str) -> Option<&'static str> {
+    let mut sessions: Vec<String> = Vec::new();
+    for folder in ["usr/share/wayland-sessions", "usr/share/xsessions"] {
+        let Ok(entries) = fs::read_dir(Path::new(rootfs).join(folder)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            sessions.push(entry.file_name().to_string_lossy().to_ascii_lowercase());
+        }
+    }
+
+    DE_SESSION_FILES
+        .iter()
+        .find(|(file, _)| sessions.iter().any(|session| session == file))
+        .map(|(_, label)| *label)
+}
+
+/// Last non-empty stderr line of a failed tool, for compact error messages.
+fn command_error(tool: &str, output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().chars().take(200).collect::<String>())
+        .unwrap_or_default();
+    if line.is_empty() {
+        format!("{} exited with status {}", tool, output.status)
+    } else {
+        format!("{}: {}", tool, line)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace cleanup
+// ---------------------------------------------------------------------------
+
+/// Copy of `App::active_work_dir` for the panic hook: `Box<dyn Fn>` cannot
+/// borrow the App state, so the path also lives in a global.
+static ACTIVE_WORK_DIR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Updates the global copy the panic hook reads.
+fn set_active_work_dir(path: Option<String>) {
+    if let Ok(mut slot) = ACTIVE_WORK_DIR.lock() {
+        *slot = path;
+    }
+}
+
+/// Deletes an extracted workspace (best effort). Runs on normal exit and
+/// from the panic hook, so it must never panic itself: stdout and removal
+/// errors are reported but ignored, and a missing folder is not an error.
+fn cleanup_workspace(path: &str) {
+    if !Path::new(path).is_dir() {
+        return;
+    }
+    let _ = writeln!(io::stdout(), "[CLEANUP] Cleaning up processes and temporary files...");
+    // A running extractor would keep writing into the folder after this
+    // process exits, so stop it before removing anything.
+    stop_active_extraction();
+    let _ = writeln!(io::stdout(), "Removing extracted workspace: {}", path);
+    if let Err(err) = fs::remove_dir_all(path) {
+        let _ = writeln!(io::stdout(), "[WARN] Could not remove {}: {}", path, err);
+    } else if let Some(parent) = Path::new(path).parent() {
+        // `./iso-builder-work` only goes away when it is empty, i.e. when no
+        // other workspace is stored there; otherwise this fails harmlessly.
+        let _ = fs::remove_dir(parent);
+    }
+}
+
+/// Panic-hook entry point: cleans up whatever workspace was active when the
+/// process crashed.
+fn cleanup_active_workspace() {
+    let path = ACTIVE_WORK_DIR
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(path) = path {
+        cleanup_workspace(&path);
+    }
+}
+
+/// Normal-exit cleanup, called after the terminal is restored: deletes the
+/// extracted workspace unless the user chose to keep it on the finish
+/// screen, then clears the global so a later panic cannot delete again.
+fn finish_session(app: &App) {
+    if let Some(path) = app.active_work_dir.as_deref() {
+        if app.keep_workspace {
+            println!("Keeping extracted workspace: {}", path);
+        } else {
+            cleanup_workspace(path);
+        }
+    }
+    set_active_work_dir(None);
+}
+
+// ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
@@ -427,6 +784,7 @@ enum Step {
     Tweaks,
     Confirm,
     Preview,
+    Finished,
 }
 
 /// How the user picks the source ISO: from the auto-discovered list or by
@@ -455,6 +813,27 @@ struct App {
     deep_scan_rx: Option<Receiver<Vec<IsoEntry>>>,
     /// Cooperative cancel flag for the running deep scan.
     deep_scan_cancel: Option<Arc<AtomicBool>>,
+    /// Receiver for the background extraction/detection started on [Enter];
+    /// `None` when nothing is being prepared.
+    iso_prep_rx: Option<Receiver<Result<IsoPrep, String>>>,
+    /// Status line about the extraction/detection, shown on the Desktop step:
+    /// the loading message while it runs, then "Detected: ...".
+    iso_info_note: Option<String>,
+    /// True after a failed extraction; [Esc] then skips straight to the
+    /// Desktop step so everything can be typed manually.
+    extraction_failed: bool,
+    /// Extraction workspace of the selected ISO
+    /// (`./iso-builder-work/<filename-without-ext>`).
+    work_dir: String,
+    /// The workspace to clean up on exit; `None` until an ISO was picked.
+    active_work_dir: Option<String>,
+    /// Distro name read from the extracted rootfs (e.g. "CachyOS Linux").
+    distro_name: String,
+    /// Set on the finish screen ([K]); `false` means the exit cleanup
+    /// deletes the extracted workspace.
+    keep_workspace: bool,
+    /// Package manager detected from the selected ISO (or "Unknown").
+    pkg_mgr: String,
     /// Informational line shown on the ISO step (e.g. "no ISOs found").
     iso_notice: Option<String>,
     desktop: String,
@@ -490,6 +869,14 @@ impl App {
             show_scan_report: false,
             deep_scan_rx: None,
             deep_scan_cancel: None,
+            iso_prep_rx: None,
+            iso_info_note: None,
+            extraction_failed: false,
+            work_dir: String::new(),
+            active_work_dir: None,
+            distro_name: "Unknown".to_string(),
+            keep_workspace: false,
+            pkg_mgr: "Unknown".to_string(),
             iso_notice: None,
             desktop: "Hyprland".to_string(),
             packages: default_packages(),
@@ -688,6 +1075,105 @@ impl App {
         }
     }
 
+    /// [Enter] on the ISO step: extract the selected ISO into its workspace
+    /// (`./iso-builder-work/<name>/`) and detect the distro details - both on
+    /// a background thread, because extraction can take minutes. The result
+    /// arrives through a channel that `poll_iso_prep` checks every frame.
+    fn start_iso_extraction(&mut self) {
+        if self.iso_path.is_empty() || self.iso_prep_rx.is_some() {
+            return;
+        }
+
+        // The workspace path is fixed by the filename; the worker creates
+        // the folders. Tracking it right away means even a quit during the
+        // extraction cleans up whatever was already written.
+        let work_dir = work_dir_for(&self.iso_path);
+        self.work_dir = work_dir.clone();
+        self.active_work_dir = Some(work_dir.clone());
+        set_active_work_dir(Some(work_dir));
+
+        self.extraction_failed = false;
+        self.is_typing = false;
+        let path = self.iso_path.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // A failed send only means the receiver was dropped (the user
+            // quit); that is not an error.
+            let _ = tx.send(prepare_iso(&path));
+        });
+        self.iso_prep_rx = Some(rx);
+        self.iso_info_note = Some(EXTRACTING_MESSAGE.to_string());
+        self.iso_notice = Some(EXTRACTING_MESSAGE.to_string());
+    }
+
+    /// Non-blocking check for a finished extraction/detection; called every
+    /// loop tick. On success the Desktop field, package manager and distro
+    /// name are pre-filled and the wizard moves on to the Desktop step; on
+    /// failure the red error stays on the ISO step so the user can pick
+    /// another image, retry, or skip ahead with [Esc].
+    fn poll_iso_prep(&mut self) {
+        let received = self.iso_prep_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(prep))) => {
+                // Re-affirm the tracked workspace (the panic hook reads the
+                // global) before pre-filling the wizard fields.
+                self.work_dir = prep.work_dir.clone();
+                self.active_work_dir = Some(prep.work_dir.clone());
+                set_active_work_dir(Some(prep.work_dir.clone()));
+                if prep.desktop != "Unknown" {
+                    self.desktop = prep.desktop.clone();
+                }
+                self.pkg_mgr = prep.pkg_mgr.clone();
+                self.distro_name = prep.distro.clone();
+                let distro_note = if prep.distro == "Unknown" {
+                    String::new()
+                } else {
+                    format!(" - {}", prep.distro)
+                };
+                self.iso_info_note =
+                    Some(format!("Detected: {} / {}{}", prep.desktop, prep.pkg_mgr, distro_note));
+                self.iso_notice = None;
+                self.extraction_failed = false;
+                self.iso_prep_rx = None;
+                if self.step == Step::IsoPath {
+                    self.next_step();
+                }
+            }
+            Some(Ok(Err(message))) => {
+                self.error_msg = Some(format!("Extraction failed: {}", message));
+                self.iso_notice = Some(
+                    "Press [Enter] to retry or [Esc] to continue without extraction.".to_string(),
+                );
+                self.iso_info_note = None;
+                self.extraction_failed = true;
+                self.iso_prep_rx = None;
+            }
+            // The worker is gone without sending; just clear the state.
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.iso_prep_rx = None;
+            }
+            // Still running (Empty) or no extraction at all (None).
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// [Esc] on the ISO step after a failed extraction: continue to the
+    /// Desktop step without pre-fill, so the user can type everything.
+    fn skip_failed_extraction(&mut self) {
+        self.extraction_failed = false;
+        self.next_step();
+        self.iso_info_note = Some(
+            "Extraction skipped - enter the Desktop Environment manually.".to_string(),
+        );
+    }
+
+    /// Finish screen: [K] keeps the extracted workspace, [D] (the default)
+    /// lets the exit cleanup delete it.
+    fn finish_session_choice(&mut self, keep: bool) {
+        self.keep_workspace = keep;
+        self.should_quit = true;
+    }
+
     /// [m] on the ISO step: switch between the auto list and manual entry.
     /// Switching back to Auto re-scans so a freshly plugged-in USB is found.
     fn toggle_iso_mode(&mut self) {
@@ -719,8 +1205,15 @@ impl App {
             Step::IsoPath => match self.iso_mode {
                 IsoMode::Auto => match self.discovered_isos.get(self.iso_cursor) {
                     Some(iso) => {
+                        if self.iso_prep_rx.is_some() {
+                            self.iso_notice = Some(EXTRACTION_RUNNING.to_string());
+                            return;
+                        }
                         self.iso_path = iso.path.clone();
-                        self.next_step();
+                        self.iso_notice = None;
+                        // The wizard advances to the Desktop step on its own
+                        // once extraction and detection finish.
+                        self.start_iso_extraction();
                     }
                     None => {
                         self.iso_mode = IsoMode::Manual;
@@ -739,8 +1232,13 @@ impl App {
                         self.error_msg = Some(format!("File not found: {}", path));
                         return;
                     }
+                    if self.iso_prep_rx.is_some() {
+                        self.iso_notice = Some(EXTRACTION_RUNNING.to_string());
+                        return;
+                    }
                     self.iso_path = path;
-                    self.next_step();
+                    self.iso_notice = None;
+                    self.start_iso_extraction();
                 }
             },
             Step::Confirm => {
@@ -752,8 +1250,14 @@ impl App {
                 self.next_step();
             }
             Step::Preview => {
+                // The script is written once the TUI exits; the finish
+                // screen now asks what should happen to the workspace.
                 self.generate_script = true;
-                self.should_quit = true;
+                self.next_step();
+            }
+            Step::Finished => {
+                // [Enter] takes the default: delete the workspace on exit.
+                self.finish_session_choice(false);
             }
             _ => self.next_step(),
         }
@@ -769,7 +1273,8 @@ impl App {
             Step::Packages => Step::Tweaks,
             Step::Tweaks => Step::Confirm,
             Step::Confirm => Step::Preview,
-            Step::Preview => Step::Preview,
+            Step::Preview => Step::Finished,
+            Step::Finished => Step::Finished,
         };
     }
 
@@ -782,6 +1287,7 @@ impl App {
             Step::Tweaks => Step::Packages,
             Step::Confirm => Step::Tweaks,
             Step::Preview => Step::Confirm,
+            Step::Finished => Step::Preview,
         };
         self.is_typing = false;
     }
@@ -794,8 +1300,9 @@ impl App {
             Step::Tweaks => 4,
             Step::Confirm => 5,
             Step::Preview => 6,
+            Step::Finished => 7,
         };
-        (current, 6)
+        (current, 7)
     }
 }
 
@@ -806,18 +1313,30 @@ impl App {
 fn main() -> Result<(), io::Error> {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
+        // Restore the terminal first so the cleanup messages are readable,
+        // then delete whatever extraction workspace was active.
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        cleanup_active_workspace();
         original_hook(panic_info);
     }));
 
     let mut app = App::new();
-    run_tui(&mut app)?;
+    let tui_result = run_tui(&mut app);
 
-    if app.generate_script {
-        write_script(&app)?;
-    }
+    let script_result = if tui_result.is_ok() && app.generate_script {
+        write_script(&app)
+    } else {
+        Ok(())
+    };
 
+    // Normal-exit cleanup: the extracted workspace is deleted unless the
+    // user chose [K] on the finish screen. Happens after the terminal is
+    // back to normal text mode.
+    finish_session(&app);
+
+    tui_result?;
+    script_result?;
     Ok(())
 }
 
@@ -851,15 +1370,17 @@ fn run_tui(app: &mut App) -> io::Result<()> {
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     while !app.should_quit {
-        // Pick up finished deep scans (non-blocking) before every frame.
+        // Pick up finished deep scans / ISO preparations (non-blocking)
+        // before every frame.
         app.poll_deep_scan();
+        app.poll_iso_prep();
 
         terminal.draw(|frame| ui(frame, app))?;
 
-        // While a deep scan runs, wake up periodically so the loading state
-        // is refreshed and results appear without extra key presses. Input is
-        // still read live, so [q]/[Ctrl+C] quit immediately.
-        let event = if app.deep_scan_rx.is_some() {
+        // While a background job runs, wake up periodically so the loading
+        // state is refreshed and results appear without extra key presses.
+        // Input is still read live, so [q]/[Ctrl+C] quit immediately.
+        let event = if app.deep_scan_rx.is_some() || app.iso_prep_rx.is_some() {
             if event::poll(Duration::from_millis(150))? {
                 event::read()?
             } else {
@@ -913,6 +1434,8 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Resu
                 KeyCode::Esc => {
                     if app.step == Step::IsoPath && app.deep_scan_rx.is_some() {
                         app.cancel_deep_scan();
+                    } else if app.step == Step::IsoPath && app.extraction_failed {
+                        app.skip_failed_extraction();
                     } else {
                         app.prev_step();
                     }
@@ -923,12 +1446,21 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Resu
                         app.is_typing = true;
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
+                KeyCode::Up => app.move_cursor(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
+                KeyCode::Char('k') => {
+                    if app.step == Step::Finished {
+                        app.finish_session_choice(true);
+                    } else {
+                        app.move_cursor(-1);
+                    }
+                }
                 KeyCode::Char(' ') => app.toggle_selected(),
                 KeyCode::Char('m') => app.toggle_iso_mode(),
                 KeyCode::Char('d') => {
-                    if app.step == Step::IsoPath && app.iso_mode == IsoMode::Auto {
+                    if app.step == Step::Finished {
+                        app.finish_session_choice(false);
+                    } else if app.step == Step::IsoPath && app.iso_mode == IsoMode::Auto {
                         app.show_scan_report = !app.show_scan_report;
                     }
                 }
@@ -977,10 +1509,11 @@ fn ui(frame: &mut Frame, app: &App) {
         Step::Tweaks => "System Tweaks",
         Step::Confirm => "Review & Generate",
         Step::Preview => "Script Preview & Debug",
+        Step::Finished => "Finish & Cleanup",
     };
 
     let title = Paragraph::new(format!(
-        "🧠 iso-builder | Step {} of {}: {}",
+        " ISO-BUILDER | Step {} of {}: {} ",
         current, total, step_name
     ))
     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
@@ -1007,7 +1540,7 @@ fn ui(frame: &mut Frame, app: &App) {
             &app.desktop,
             app.is_typing,
             app.error_msg.as_deref(),
-            None,
+            app.iso_info_note.as_deref(),
         ),
         Step::Packages => {
             let rows: Vec<CheckRow> = app
@@ -1019,7 +1552,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 })
                 .collect();
             let title = format!(
-                " Extra Packages — {} selected ",
+                " Extra Packages - {} selected ",
                 app.selected_packages().len()
             );
             draw_checklist(frame, chunks[1], &title, &rows, app.package_cursor);
@@ -1034,16 +1567,18 @@ fn ui(frame: &mut Frame, app: &App) {
                 })
                 .collect();
             let title = format!(
-                " System Tweaks — {} selected ",
+                " System Tweaks - {} selected ",
                 app.selected_tweaks().len()
             );
             draw_checklist(frame, chunks[1], &title, &rows, app.tweak_cursor);
         }
         Step::Confirm => {
             let summary = format!(
-                "Original ISO: {}\nDesktop Env: {}\nPackages: {}\nSystem Tweaks: {}\n\nPress [Enter] to build the script for review.",
+                "Original ISO: {}\nDistro: {}\nDesktop Env: {}\nPackage Mgr: {}\nPackages: {}\nSystem Tweaks: {}\n\nPress [Enter] to build the script for review.",
                 app.iso_path,
+                app.distro_name,
                 app.desktop,
+                app.pkg_mgr,
                 app.packages_summary(),
                 app.tweaks_summary()
             );
@@ -1058,7 +1593,7 @@ fn ui(frame: &mut Frame, app: &App) {
             // Script view on top, debug summary pinned underneath.
             let panes = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(6)])
+                .constraints([Constraint::Min(6), Constraint::Length(8)])
                 .split(chunks[1]);
 
             let script = Paragraph::new(app.generated_script.as_str())
@@ -1072,10 +1607,18 @@ fn ui(frame: &mut Frame, app: &App) {
                 );
             frame.render_widget(script, panes[0]);
 
+            let workspace = if app.work_dir.is_empty() {
+                "(not extracted)"
+            } else {
+                app.work_dir.as_str()
+            };
             let debug = format!(
-                "Packages to install: {}\nTweaks to apply: {}\nNote: PKG_MGR is detected at runtime inside the script (see the if/elif block above).",
+                "Packages to install: {}\nTweaks to apply: {}\nDistro / package manager: {} / {}\nExtracted to: {}\nNote: PKG_MGR is re-checked at runtime inside the script.",
                 app.packages_summary(),
-                app.tweaks_summary()
+                app.tweaks_summary(),
+                app.distro_name,
+                app.pkg_mgr,
+                workspace
             );
             frame.render_widget(
                 Paragraph::new(debug)
@@ -1087,6 +1630,28 @@ fn ui(frame: &mut Frame, app: &App) {
                             .border_style(Style::default().fg(Color::Yellow)),
                     ),
                 panes[1],
+            );
+        }
+        Step::Finished => {
+            let workspace = app.active_work_dir.as_deref().unwrap_or("(no extraction)");
+            let summary = format!(
+                "[OK] run-builder.sh is built and will be written when iso-builder exits.\n\n\
+                 Extracted workspace:\n  {}\n\n\
+                 Clean up the extracted files when iso-builder exits?\n\n\
+                 \u{20}\u{20}[K] Keep extracted files (for debugging/reuse)\n\
+                 \u{20}\u{20}[D] Delete them now  (default)\n\n\
+                 Press [K] or [D] to finish, [Esc] to go back.",
+                workspace
+            );
+            frame.render_widget(
+                Paragraph::new(summary)
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .title(" Finish & Cleanup ")
+                            .borders(Borders::ALL),
+                    ),
+                chunks[1],
             );
         }
     }
@@ -1115,7 +1680,10 @@ fn ui(frame: &mut Frame, app: &App) {
                 }
                 IsoMode::Manual => " [i] to type | [Enter] Select | [m] Auto Detect | [q]/[Ctrl+C] Quit ",
             },
-            Step::Preview => " [j/k] Scroll | [Enter] Save & Exit | [Esc] Back | [Ctrl+C] Quit ",
+            Step::Preview => " [j/k] Scroll | [Enter] Review Cleanup | [Esc] Back | [q] Quit ",
+            Step::Finished => {
+                " [K] Keep extracted files | [D] Delete (default) | [Enter] Delete | [Esc] Back "
+            }
             _ => " [i] to type | [Enter] to continue | [Esc] to go back | [q]/[Ctrl+C] to quit ",
         }
     };
@@ -1178,7 +1746,7 @@ fn draw_checklist(frame: &mut Frame, area: Rect, title: &str, rows: &[CheckRow],
 /// big "No ISOs found" message is shown instead.
 fn draw_iso_list(frame: &mut Frame, area: Rect, isos: &[IsoEntry], cursor: usize) {
     let block = Block::default()
-        .title(format!(" Auto-discovered ISOs — {} found ", isos.len()))
+        .title(format!(" Auto-discovered ISOs - {} found ", isos.len()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -1258,11 +1826,15 @@ fn draw_auto_view(frame: &mut Frame, area: Rect, app: &App) {
     // The loading state sits on top of whatever the ISO step is showing.
     if app.deep_scan_rx.is_some() {
         draw_deep_scan_overlay(frame, area);
+    } else if app.iso_prep_rx.is_some() {
+        draw_extraction_overlay(frame, area);
+    } else if let Some(message) = app.error_msg.as_deref() {
+        draw_error_overlay(frame, area, message);
     }
 }
 
 /// The " Scan Report " panel: one line per scanned folder. Failures are
-/// flagged with `⚠` and highlighted in red.
+/// flagged with `[WARN]` and highlighted in red.
 fn draw_scan_report(frame: &mut Frame, area: Rect, scanned_paths: &[String]) {
     let lines: Vec<Line> = if scanned_paths.is_empty() {
         vec![
@@ -1272,7 +1844,7 @@ fn draw_scan_report(frame: &mut Frame, area: Rect, scanned_paths: &[String]) {
         scanned_paths
             .iter()
             .map(|line| {
-                let style = if line.starts_with('⚠') {
+                let style = if line.starts_with("[WARN]") {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -1323,7 +1895,7 @@ fn draw_deep_scan_overlay(frame: &mut Frame, area: Rect) {
 
     let message = vec![
         Line::from(""),
-        Line::from("🔍 Deep scanning for ISOs > 500MB...")
+        Line::from("[SCAN] Deep scanning for ISOs > 500MB...")
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Line::from("Skip system folders. Press [Esc] to cancel.")
             .style(Style::default().fg(Color::Yellow)),
@@ -1337,6 +1909,76 @@ fn draw_deep_scan_overlay(frame: &mut Frame, area: Rect) {
                     .title(" Deep Scan ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
+            ),
+        popup,
+    );
+}
+
+/// Centered loading popup shown over the ISO list while the selected ISO is
+/// extracted into its workspace and inspected (xorriso/7z + unsquashfs).
+fn draw_extraction_overlay(frame: &mut Frame, area: Rect) {
+    let width = (area.width.saturating_sub(4)).clamp(20, 72).min(area.width);
+    let height = (area.height.saturating_sub(2)).clamp(5, 6).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let message = vec![
+        Line::from(""),
+        Line::from(EXTRACTING_MESSAGE)
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Line::from("The workspace is cleaned up on exit; [q] quits.")
+            .style(Style::default().fg(Color::DarkGray)),
+    ];
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Extracting ISO ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+        popup,
+    );
+}
+
+/// Centered red popup with the last failure (e.g. a failed extraction),
+/// drawn over the ISO list.
+fn draw_error_overlay(frame: &mut Frame, area: Rect, message: &str) {
+    let width = (area.width.saturating_sub(4)).clamp(24, 72).min(area.width);
+    let height = (area.height.saturating_sub(2)).clamp(6, 9).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let text = vec![
+        Line::from(""),
+        Line::from("[WARN] Error".to_string())
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Line::from(message.to_string()).style(Style::default().fg(Color::Red)),
+        Line::from(""),
+        Line::from("Press [Enter] to retry or [Esc] to continue without extraction.")
+            .style(Style::default().fg(Color::DarkGray)),
+    ];
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Extraction ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
             ),
         popup,
     );
@@ -1370,11 +2012,11 @@ fn draw_input(
         .collect();
     if let Some(err) = error {
         lines.push(Line::from(""));
-        lines.push(Line::from(format!("⚠ {}", err)).style(Style::default().fg(Color::Red)));
+        lines.push(Line::from(format!("[WARN] {}", err)).style(Style::default().fg(Color::Red)));
     }
     if let Some(note) = note {
         lines.push(Line::from(""));
-        lines.push(Line::from(format!("ℹ {}", note)).style(Style::default().fg(Color::Yellow)));
+        lines.push(Line::from(format!("[INFO] {}", note)).style(Style::default().fg(Color::Yellow)));
     }
 
     // Where the caret sits once the text wraps, plus the scroll needed to keep
@@ -1443,6 +2085,17 @@ fn build_script(app: &App) -> String {
     ));
     script.push_str(&format!("SOURCE_ISO={}\n", shell_single_quote(&app.iso_path)));
 
+    // The script shares its workspace with the TUI: when the extracted
+    // files are still around (the user kept them on exit) they are reused
+    // as-is; otherwise the script extracts the ISO itself, so it keeps
+    // working on another machine.
+    let work_dir = if app.work_dir.is_empty() {
+        format!("{}/image", WORK_ROOT)
+    } else {
+        app.work_dir.clone()
+    };
+    script.push_str(&format!("WORK_DIR={}\n", shell_single_quote(&work_dir)));
+
     script.push_str(
         r#"
 # ---------------------------------------------------------------------------
@@ -1450,18 +2103,36 @@ fn build_script(app: &App) -> String {
 #   pacman -> Arch, CachyOS, Manjaro, EndeavourOS, Garuda, Artix
 #   apt    -> Debian, Ubuntu, Linux Mint, Pop!_OS, Kali, Zorin OS
 #   dnf    -> Fedora, RHEL, CentOS, Rocky, AlmaLinux, Bazzite
+#   zypper -> openSUSE, SUSE Linux Enterprise
+#   xbps   -> Void Linux
+#   emerge -> Gentoo, Funtoo
 #   apk    -> Alpine Linux, postmarketOS
 #
-# Detection is layered and never trusts a single tool:
+# WORK_DIR above is the extraction workspace shared with iso-builder
+# (WORK_DIR/iso-root + WORK_DIR/rootfs). When it still holds a finished
+# extraction, that copy is reused and nothing is extracted again; when the
+# folder is missing (fresh machine, or it was cleaned up on exit), the ISO
+# is extracted here first. Detection is layered and never trusts a single
+# tool:
 #   1) the ISO's own file listing is inspected with whichever tool is
 #      installed (7z, xorriso, isoinfo or bsdtar),
-#   2) if that finds nothing, the extracted rootfs is probed from inside the
-#      chroot.
+#   2) the extracted rootfs is checked for the package manager's binary,
+#   3) as a last resort the same check runs inside the chroot.
 # If the final answer is still wrong, force it via PKG_MGR_OVERRIDE below.
 PKG_MGR_OVERRIDE=""
 
 if [ "$(id -u)" -ne 0 ]; then echo "Please run this script as root (sudo)."; exit 1; fi
-if [ ! -f "$SOURCE_ISO" ]; then echo "Error: ISO file not found at $SOURCE_ISO"; exit 1; fi
+
+ROOTFS="$WORK_DIR/rootfs"
+SQFS_FILE=$(find "$WORK_DIR/iso-root" \( -iname "*.sfs" -o -iname "*.squashfs" \) 2>/dev/null | head -n 1 || true)
+REUSE_EXTRACTION=""
+if [ -n "$SQFS_FILE" ] && [ -d "$ROOTFS" ] && [ -n "$(ls -A "$ROOTFS" 2>/dev/null)" ]; then
+    REUSE_EXTRACTION=1
+    echo "Reusing existing extraction in $WORK_DIR (delete it to force a fresh extraction)."
+elif [ ! -f "$SOURCE_ISO" ]; then
+    echo "Error: ISO file not found at $SOURCE_ISO and no extracted workspace under $WORK_DIR to reuse."
+    exit 1
+fi
 
 echo "Detecting distro structure..."
 
@@ -1480,6 +2151,8 @@ PKG_MGR=""
 if [ -n "$PKG_MGR_OVERRIDE" ]; then
     PKG_MGR="$PKG_MGR_OVERRIDE"
     echo "Using manual override: $PKG_MGR"
+elif [ -n "$REUSE_EXTRACTION" ]; then
+    echo "Using the cached extraction in $WORK_DIR."
 elif [ "$DETECT_CMD" = "7z" ]; then
     ISO_LIST=$(7z l "$SOURCE_ISO" 2>/dev/null || true)
     echo "$ISO_LIST" | grep -q "airootfs.sfs" && PKG_MGR="pacman"
@@ -1500,31 +2173,55 @@ elif [ "$DETECT_CMD" = "bsdtar" ]; then
     echo "$ISO_LIST" | grep -q "filesystem.squashfs" && PKG_MGR="apt"
 fi
 
-if [ -z "$PKG_MGR" ]; then
-    echo "Pre-extraction detection failed. Will detect inside chroot..."
+if [ -z "$REUSE_EXTRACTION" ]; then
+    echo "Extracting ISO... This may take a few minutes."
+    rm -rf "$WORK_DIR/iso-root" "$ROOTFS"
+    mkdir -p "$WORK_DIR/iso-root" "$ROOTFS"
+    if command -v xorriso >/dev/null 2>&1 && xorriso -osirrox on -indev "$SOURCE_ISO" -extract / "$WORK_DIR/iso-root"; then
+        echo "Extracted with xorriso."
+    else
+        rm -rf "$WORK_DIR/iso-root" && mkdir -p "$WORK_DIR/iso-root"
+        if command -v 7z >/dev/null 2>&1 && 7z x -y "$SOURCE_ISO" -o"$WORK_DIR/iso-root" >/dev/null; then
+            echo "Extracted with 7z."
+        else
+            echo "FATAL: neither xorriso nor 7z could extract the ISO."
+            exit 1
+        fi
+    fi
+    chmod -R +w "$WORK_DIR/iso-root" 2>/dev/null || true
+
+    echo "Extracting Squashfs..."
+    SQFS_FILE=$(find "$WORK_DIR/iso-root" \( -iname "*.sfs" -o -iname "*.squashfs" \) | head -n 1)
+    if [ -z "$SQFS_FILE" ]; then echo "Error: no squashfs image found inside the ISO"; exit 1; fi
+    unsquashfs -f -d "$ROOTFS" "$SQFS_FILE"
 fi
 
-WORK_DIR="./remaster-workspace"
-rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR/iso-root" "$WORK_DIR/squashfs-root"
-
-echo "Extracting ISO..."
-xorriso -osirrox on -indev "$SOURCE_ISO" -extract / "$WORK_DIR/iso-root"
-chmod -R +w "$WORK_DIR/iso-root"
-
-echo "Extracting Squashfs..."
-SQFS_FILE=$(find "$WORK_DIR/iso-root" -name "*.sfs" -o -name "*.squashfs" | head -n 1)
-if [ -z "$SQFS_FILE" ]; then echo "Error: no squashfs image found inside the ISO"; exit 1; fi
-unsquashfs -d "$WORK_DIR/squashfs-root" "$SQFS_FILE"
-
+if [ -z "$PKG_MGR" ]; then
+    echo "Detecting package manager from the extracted rootfs..."
+    if [ -x "$ROOTFS/usr/bin/pacman" ]; then PKG_MGR="pacman"
+    elif [ -x "$ROOTFS/usr/bin/apt" ]; then PKG_MGR="apt"
+    elif [ -x "$ROOTFS/usr/bin/dnf" ]; then PKG_MGR="dnf"
+    elif [ -x "$ROOTFS/usr/bin/zypper" ]; then PKG_MGR="zypper"
+    elif [ -x "$ROOTFS/usr/bin/xbps-install" ]; then PKG_MGR="xbps"
+    elif [ -x "$ROOTFS/usr/bin/emerge" ]; then PKG_MGR="emerge"
+    elif [ -x "$ROOTFS/sbin/apk" ] || [ -x "$ROOTFS/usr/bin/apk" ]; then PKG_MGR="apk"
+    fi
+fi
 if [ -z "$PKG_MGR" ]; then
     echo "Detecting package manager inside chroot..."
-    if arch-chroot "$WORK_DIR/squashfs-root" command -v pacman >/dev/null 2>&1; then
+    if arch-chroot "$ROOTFS" command -v pacman >/dev/null 2>&1; then
         PKG_MGR="pacman"
-    elif arch-chroot "$WORK_DIR/squashfs-root" command -v apt-get >/dev/null 2>&1; then
+    elif arch-chroot "$ROOTFS" command -v apt-get >/dev/null 2>&1; then
         PKG_MGR="apt"
-    elif arch-chroot "$WORK_DIR/squashfs-root" command -v dnf >/dev/null 2>&1; then
+    elif arch-chroot "$ROOTFS" command -v dnf >/dev/null 2>&1; then
         PKG_MGR="dnf"
-    elif arch-chroot "$WORK_DIR/squashfs-root" command -v apk >/dev/null 2>&1; then
+    elif arch-chroot "$ROOTFS" command -v zypper >/dev/null 2>&1; then
+        PKG_MGR="zypper"
+    elif arch-chroot "$ROOTFS" command -v xbps-install >/dev/null 2>&1; then
+        PKG_MGR="xbps"
+    elif arch-chroot "$ROOTFS" command -v emerge >/dev/null 2>&1; then
+        PKG_MGR="emerge"
+    elif arch-chroot "$ROOTFS" command -v apk >/dev/null 2>&1; then
         PKG_MGR="apk"
     else
         echo "FATAL: Could not detect package manager!"
@@ -1532,17 +2229,17 @@ if [ -z "$PKG_MGR" ]; then
     fi
 fi
 case "$PKG_MGR" in
-    pacman|apt|dnf|apk) ;;
-    *) echo "Error: unknown package manager '$PKG_MGR' (use pacman, apt, dnf or apk)"; exit 1 ;;
+    pacman|apt|dnf|zypper|xbps|emerge|apk) ;;
+    *) echo "Error: unknown package manager '$PKG_MGR' (use pacman, apt, dnf, zypper, xbps, emerge or apk)"; exit 1 ;;
 esac
 echo "Using package manager: $PKG_MGR"
 echo "If this is wrong, set PKG_MGR_OVERRIDE at the top of this script and re-run."
 
 echo "Mounting virtual filesystems for chroot..."
-mount -t proc /proc "$WORK_DIR/squashfs-root/proc"
-mount --rbind /sys "$WORK_DIR/squashfs-root/sys"
-mount --rbind /dev "$WORK_DIR/squashfs-root/dev"
-cp /etc/resolv.conf "$WORK_DIR/squashfs-root/etc/resolv.conf" 2>/dev/null || true
+mount -t proc /proc "$ROOTFS/proc"
+mount --rbind /sys "$ROOTFS/sys"
+mount --rbind /dev "$ROOTFS/dev"
+cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
 "#,
     );
     script.push('\n');
@@ -1555,19 +2252,31 @@ cp /etc/resolv.conf "$WORK_DIR/squashfs-root/etc/resolv.conf" 2>/dev/null || tru
         script.push_str("echo 'Installing selected packages...'\n");
         script.push_str("case \"$PKG_MGR\" in\n");
         script.push_str(&format!(
-            "    pacman) arch-chroot \"$WORK_DIR/squashfs-root\" bash -c {} ;;\n",
+            "    pacman) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
             shell_single_quote(&format!("pacman -S --noconfirm {}", packages))
         ));
         script.push_str(&format!(
-            "    apt) arch-chroot \"$WORK_DIR/squashfs-root\" bash -c {} ;;\n",
+            "    apt) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
             shell_single_quote(&format!("apt-get update && apt-get install -y {}", packages))
         ));
         script.push_str(&format!(
-            "    dnf) arch-chroot \"$WORK_DIR/squashfs-root\" bash -c {} ;;\n",
+            "    dnf) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
             shell_single_quote(&format!("dnf install -y {}", packages))
         ));
         script.push_str(&format!(
-            "    apk) arch-chroot \"$WORK_DIR/squashfs-root\" bash -c {} ;;\n",
+            "    zypper) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
+            shell_single_quote(&format!("zypper -n install -y {}", packages))
+        ));
+        script.push_str(&format!(
+            "    xbps) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
+            shell_single_quote(&format!("xbps-install -Sy {}", packages))
+        ));
+        script.push_str(&format!(
+            "    emerge) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
+            shell_single_quote(&format!("emerge --noreplace {}", packages))
+        ));
+        script.push_str(&format!(
+            "    apk) arch-chroot \"$ROOTFS\" bash -c {} ;;\n",
             shell_single_quote(&format!("apk add {}", packages))
         ));
         script.push_str("esac\n");
@@ -1583,7 +2292,7 @@ cp /etc/resolv.conf "$WORK_DIR/squashfs-root/etc/resolv.conf" 2>/dev/null || tru
                 shell_single_quote(&format!("  - {}", name))
             ));
             script.push_str(&format!(
-                "arch-chroot \"$WORK_DIR/squashfs-root\" bash -c {}\n",
+                "arch-chroot \"$ROOTFS\" bash -c {}\n",
                 shell_single_quote(command)
             ));
         }
@@ -1592,20 +2301,23 @@ cp /etc/resolv.conf "$WORK_DIR/squashfs-root/etc/resolv.conf" 2>/dev/null || tru
     script.push_str(
         r#"
 echo "Unmounting filesystems..."
-umount -l "$WORK_DIR/squashfs-root/proc"
-umount -l "$WORK_DIR/squashfs-root/sys"
-umount -l "$WORK_DIR/squashfs-root/dev"
+umount -l "$ROOTFS/proc"
+umount -l "$ROOTFS/sys"
+umount -l "$ROOTFS/dev"
 
 echo "Repacking Squashfs..."
 rm -f "$SQFS_FILE"
-mksquashfs "$WORK_DIR/squashfs-root" "$SQFS_FILE" -comp xz -b 1M
+mksquashfs "$ROOTFS" "$SQFS_FILE" -comp xz -b 1M
 
 echo "Repacking final ISO..."
 # NOTE: these xorriso flags assume an archiso-style boot layout
 # (isolinux + EFI/archiso/efiboot.img); other distros need their own layout.
 xorriso -as mkisofs -o "custom-remaster.iso" -isohybrid-mbr /usr/lib/syslinux/bios/isohdpfx.bin -c isolinux/boot.cat -b isolinux/isolinux.bin -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e EFI/archiso/efiboot.img -no-emul-boot -isohybrid-gpt-basdat "$WORK_DIR/iso-root"
 
-echo "✅ Done! Saved as custom-remaster.iso"
+echo "[OK] Done! Saved as custom-remaster.iso"
+
+echo "[CLEANUP] Cleaning up the extracted workspace..."
+rm -rf "$WORK_DIR"
 "#,
     );
     script.push('\n');
@@ -1616,7 +2328,7 @@ echo "✅ Done! Saved as custom-remaster.iso"
 /// Writes the reviewed script to `run-builder.sh` and marks it executable.
 /// What is written is exactly what the preview showed.
 fn write_script(app: &App) -> io::Result<()> {
-    println!("\n🔨 Generating script for: {}", app.desktop);
+    println!("\n[BUILD] Generating script for: {}", app.desktop);
 
     let mut file = File::create("run-builder.sh")?;
     file.write_all(app.generated_script.as_bytes())?;
@@ -1630,6 +2342,6 @@ fn write_script(app: &App) -> io::Result<()> {
         std::fs::set_permissions("run-builder.sh", permissions)?;
     }
 
-    println!("✅ Successfully generated run-builder.sh!");
+    println!("[OK] Successfully generated run-builder.sh!");
     Ok(())
 }
