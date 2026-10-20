@@ -435,6 +435,97 @@ fi
     script.push_str("esac\n\n");
 }
 
+/// Shell helpers that remove desktops from the installer inside the rootfs.
+/// They run on the host against `$ROOTFS`, not inside the chroot, and never
+/// need python: Calamares configs are regular enough for awk.
+const DESKTOP_HELPERS: &str = r##"host_step() {
+    label="$1"; shift
+    echo "  - $label"
+    if ! "$@"; then
+        echo "    [WARN] failed: $label"
+        FAILED+=("$label")
+    fi
+}
+# Drops the ids in $DROP_DESKTOPS from a packagechooser config and repoints
+# `default:` when it named a removed one. Fails if nothing was removed.
+edit_chooser() {
+    [ -f "$1" ] || { echo "    missing: $1"; return 1; }
+    awk -v q="'" -v drop="$DROP_DESKTOPS" -v newdef="$DEFAULT_DESKTOP" '
+        function indent(s) { match(s, /^ */); return RLENGTH }
+        function unq(v) { sub(/[ \t\r]+$/, "", v); gsub("^[\"" q "]|[\"" q "]$", "", v); return v }
+        BEGIN { n = split(drop, list, " "); for (i = 1; i <= n; i++) gone[list[i]] = 1; skip = 0; r = 0 }
+        /^[ ]*- id:/ {
+            v = $0; sub(/^[ ]*- id:[ ]*/, "", v)
+            skip = (unq(v) in gone)
+            if (skip) { r++; depth = indent($0); next }
+        }
+        skip {
+            if ($0 ~ /^[ \t]*$/) next
+            if (indent($0) > depth) next
+            skip = 0
+        }
+        /^default:/ {
+            v = $0; sub(/^default:[ ]*/, "", v)
+            if (unq(v) in gone) { print "default: \"" newdef "\""; next }
+        }
+        { print }
+        END { if (r == 0) exit 3 }
+    ' "$1" > "$1.new" || { rm -f "$1.new"; echo "    no listed desktop found in $1"; return 1; }
+    cat "$1.new" > "$1" && rm -f "$1.new"
+}
+# Drops the groups named in $DROP_DESKTOPS from a netinstall group file.
+edit_netinstall() {
+    [ -f "$1" ] || { echo "    missing: $1"; return 1; }
+    awk -v q="'" -v drop="$DROP_DESKTOPS" '
+        function unq(v) { sub(/[ \t\r]+$/, "", v); gsub("^[\"" q "]|[\"" q "]$", "", v); return v }
+        BEGIN { n = split(drop, list, " "); for (i = 1; i <= n; i++) gone[list[i]] = 1; skip = 0 }
+        /^- name:/ {
+            v = $0; sub(/^- name:[ ]*/, "", v)
+            skip = (unq(v) in gone)
+            if (skip) next
+        }
+        skip { if ($0 ~ /^(#|---)/) skip = 0; else next }
+        { print }
+    ' "$1" > "$1.new" || { rm -f "$1.new"; return 1; }
+    cat "$1.new" > "$1" && rm -f "$1.new"
+}
+"##;
+
+/// Removes the desktops the user unchecked from the installer's chooser
+/// config and netinstall package list inside the extracted rootfs.
+fn push_desktop_section(script: &mut String, app: &App) {
+    let removed = app.removed_desktops();
+    if removed.is_empty() || app.chooser_path.is_empty() {
+        return;
+    }
+    let ids: Vec<&str> = removed.iter().map(|d| d.id.as_str()).collect();
+    let default = app
+        .desktops
+        .iter()
+        .find(|d| d.keep)
+        .map(|d| d.id.as_str())
+        .unwrap_or("");
+
+    script.push_str("echo 'Removing desktops from the installer...'\n");
+    script.push_str(&format!(
+        "DROP_DESKTOPS={}\n",
+        shell_single_quote(&ids.join(" "))
+    ));
+    script.push_str(&format!("DEFAULT_DESKTOP={}\n", shell_single_quote(default)));
+    script.push_str(DESKTOP_HELPERS);
+    script.push_str(&format!(
+        "host_step 'Remove desktops from the installer chooser' edit_chooser \"$ROOTFS\"/{}\n",
+        shell_single_quote(&app.chooser_path)
+    ));
+    for path in &app.netinstall_paths {
+        script.push_str(&format!(
+            "host_step 'Remove desktops from the netinstall groups' edit_netinstall \"$ROOTFS\"/{}\n",
+            shell_single_quote(path)
+        ));
+    }
+    script.push('\n');
+}
+
 /// Tweaks, hostname and the custom command, each as a non-fatal `step`.
 fn push_tweak_section(script: &mut String, app: &App) {
     let tweaks = app.selected_tweaks();
@@ -509,6 +600,7 @@ pub fn build_script(app: &App) -> String {
     script.push_str(SCRIPT_PRELUDE);
     push_package_section(&mut script, app);
     push_tweak_section(&mut script, app);
+    push_desktop_section(&mut script, app);
     script.push_str(SCRIPT_EPILOGUE);
     script
 }
@@ -581,5 +673,40 @@ mod tests {
         assert!(!script.contains("install_packages '"));
         assert!(!script.contains("step 'Set hostname'"));
         assert!(script.contains("trap cleanup_on_exit EXIT"));
+    }
+
+    #[test]
+    fn unchecked_desktops_are_removed_from_the_installer_files() {
+        use crate::app::state::DesktopOption;
+        let mut app = app_with_iso("/tmp/x.iso");
+        app.chooser_path = "etc/calamares/modules/packagechooser_desktop.conf".to_string();
+        app.netinstall_paths = vec!["etc/calamares/modules/netinstall.yaml".to_string()];
+        app.desktops = ["KDE-Desktop", "Hyprland", "Xfce4"]
+            .iter()
+            .map(|id| DesktopOption {
+                id: id.to_string(),
+                name: id.to_string(),
+                keep: *id != "KDE-Desktop" && *id != "Hyprland",
+            })
+            .collect();
+        let script = build_script(&app);
+
+        assert!(script.contains("DROP_DESKTOPS='KDE-Desktop Hyprland'"));
+        assert!(script.contains("DEFAULT_DESKTOP='Xfce4'"));
+        assert!(script.contains("edit_chooser \"$ROOTFS\"/'etc/calamares/modules/packagechooser_desktop.conf'"));
+        assert!(script.contains("edit_netinstall \"$ROOTFS\"/'etc/calamares/modules/netinstall.yaml'"));
+    }
+
+    #[test]
+    fn keeping_every_desktop_adds_nothing_to_the_script() {
+        use crate::app::state::DesktopOption;
+        let mut app = app_with_iso("/tmp/x.iso");
+        app.chooser_path = "etc/calamares/modules/packagechooser_desktop.conf".to_string();
+        app.desktops = vec![DesktopOption {
+            id: "KDE-Desktop".to_string(),
+            name: "Plasma".to_string(),
+            keep: true,
+        }];
+        assert!(!build_script(&app).contains("DROP_DESKTOPS"));
     }
 }

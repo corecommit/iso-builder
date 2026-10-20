@@ -29,11 +29,22 @@ use crate::utils::{
 pub enum Step {
     IsoPath,
     Packages,
+    /// Desktops the distro's installer offers; skipped when none were found.
+    Desktops,
     Tweaks,
     Custom,
     Confirm,
     Preview,
     Finished,
+}
+
+/// One desktop the ISO's installer offers. Unchecking it (`keep == false`)
+/// removes it from the installer's chooser and package list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopOption {
+    pub id: String,
+    pub name: String,
+    pub keep: bool,
 }
 
 /// How the user picks the source ISO: from the auto-discovered list or by
@@ -105,6 +116,14 @@ pub struct App {
     pub iso_notice: Option<String>,
     /// Desktop environment detected in the ISO (display only).
     pub desktop: String,
+    /// Desktops the installer inside the ISO offers (empty when unsupported).
+    pub desktops: Vec<DesktopOption>,
+    pub desktop_cursor: usize,
+    /// Rootfs-relative installer files the script edits to drop desktops.
+    pub chooser_path: String,
+    pub netinstall_paths: Vec<String>,
+    /// `drop_desktop=` ids from a preset, applied once detection finishes.
+    pub preset_desktop_drops: Vec<String>,
     pub packages: Vec<PackageOption>,
     pub package_cursor: usize,
     pub tweaks: Vec<PresetOption>,
@@ -165,6 +184,11 @@ impl App {
             pkg_mgr: "Unknown".to_string(),
             iso_notice: None,
             desktop: "Unknown".to_string(),
+            desktops: Vec::new(),
+            desktop_cursor: 0,
+            chooser_path: String::new(),
+            netinstall_paths: Vec::new(),
+            preset_desktop_drops: Vec::new(),
             packages: default_packages(),
             package_cursor: 0,
             tweaks: default_tweaks(),
@@ -200,6 +224,25 @@ impl App {
 
     pub fn selected_tweaks(&self) -> Vec<&PresetOption> {
         self.tweaks.iter().filter(|t| t.selected).collect()
+    }
+
+    /// Installer desktops the user unchecked.
+    pub fn removed_desktops(&self) -> Vec<&DesktopOption> {
+        self.desktops.iter().filter(|d| !d.keep).collect()
+    }
+
+    /// Review-screen text for the Desktops step.
+    pub fn desktops_summary(&self) -> String {
+        if self.desktops.is_empty() {
+            return "Not offered by this ISO".to_string();
+        }
+        let removed = self.removed_desktops();
+        if removed.is_empty() {
+            format!("All {} kept", self.desktops.len())
+        } else {
+            let names: Vec<&str> = removed.iter().map(|d| d.name.as_str()).collect();
+            format!("Removing {}", names.join(", "))
+        }
     }
 
     /// Extra package names typed on the Custom step.
@@ -287,6 +330,15 @@ impl App {
         for tweak in self.tweaks.iter().filter(|t| t.selected) {
             out.push_str(&format!("tweak={}\n", tweak.name));
         }
+        let mut dropped: Vec<&str> = self.removed_desktops().iter().map(|d| d.id.as_str()).collect();
+        for id in &self.preset_desktop_drops {
+            if !self.desktops.iter().any(|d| d.id == *id) {
+                dropped.push(id);
+            }
+        }
+        for id in dropped {
+            out.push_str(&format!("drop_desktop={}\n", id));
+        }
         for (key, field) in [
             ("custom_packages", FIELD_PACKAGES),
             ("custom_command", FIELD_COMMAND),
@@ -328,6 +380,14 @@ impl App {
                 "tweak" => {
                     if let Some(tweak) = self.tweaks.iter_mut().find(|t| t.name == value) {
                         tweak.selected = true;
+                    }
+                }
+                "drop_desktop" => {
+                    if !value.is_empty() {
+                        self.preset_desktop_drops.push(value.to_string());
+                        if let Some(desktop) = self.desktops.iter_mut().find(|d| d.id == value) {
+                            desktop.keep = false;
+                        }
                     }
                 }
                 "custom_packages" => self.custom[FIELD_PACKAGES] = value.to_string(),
@@ -407,6 +467,15 @@ impl App {
                     };
                 }
             }
+            Step::Desktops => {
+                if let Some(max) = self.desktops.len().checked_sub(1) {
+                    self.desktop_cursor = if delta < 0 {
+                        self.desktop_cursor.saturating_sub(1)
+                    } else {
+                        (self.desktop_cursor + 1).min(max)
+                    };
+                }
+            }
             Step::Tweaks => {
                 if let Some(max) = self.tweaks.len().checked_sub(1) {
                     self.tweak_cursor = if delta < 0 {
@@ -442,6 +511,11 @@ impl App {
             Step::Packages => {
                 if let Some(option) = self.packages.get_mut(self.package_cursor) {
                     option.selected = !option.selected;
+                }
+            }
+            Step::Desktops => {
+                if let Some(option) = self.desktops.get_mut(self.desktop_cursor) {
+                    option.keep = !option.keep;
                 }
             }
             Step::Tweaks => {
@@ -603,6 +677,19 @@ impl App {
                     Some(prep.work_dir.clone())
                 });
                 self.desktop = prep.desktop.clone();
+                self.chooser_path = prep.desktops.chooser_path.clone();
+                self.netinstall_paths = prep.desktops.netinstall_paths.clone();
+                self.desktops = prep
+                    .desktops
+                    .choices
+                    .iter()
+                    .map(|choice| DesktopOption {
+                        id: choice.id.clone(),
+                        name: choice.name.clone(),
+                        keep: !self.preset_desktop_drops.contains(&choice.id),
+                    })
+                    .collect();
+                self.desktop_cursor = 0;
                 self.pkg_mgr = prep.pkg_mgr.clone();
                 self.distro_name = prep.distro.clone();
                 let distro_note = if prep.distro == "Unknown" {
@@ -769,20 +856,35 @@ impl App {
         }
     }
 
+    /// Wizard order. The Desktops step only exists when the ISO's installer
+    /// offered a desktop list.
+    fn step_order(&self) -> Vec<Step> {
+        let mut order = vec![Step::IsoPath, Step::Packages];
+        if !self.desktops.is_empty() {
+            order.push(Step::Desktops);
+        }
+        order.extend([
+            Step::Tweaks,
+            Step::Custom,
+            Step::Confirm,
+            Step::Preview,
+            Step::Finished,
+        ]);
+        order
+    }
+
+    fn step_position(&self, order: &[Step]) -> usize {
+        order.iter().position(|step| *step == self.step).unwrap_or(0)
+    }
+
     pub fn next_step(&mut self) {
         self.error_msg = None;
         self.custom_invalid = None;
         self.status_msg = None;
 
-        self.step = match self.step {
-            Step::IsoPath => Step::Packages,
-            Step::Packages => Step::Tweaks,
-            Step::Tweaks => Step::Custom,
-            Step::Custom => Step::Confirm,
-            Step::Confirm => Step::Preview,
-            Step::Preview => Step::Finished,
-            Step::Finished => Step::Finished,
-        };
+        let order = self.step_order();
+        let next = (self.step_position(&order) + 1).min(order.len() - 1);
+        self.step = order[next];
         // The Custom step is all text fields, so start in edit mode.
         self.is_typing = self.step == Step::Custom;
     }
@@ -795,29 +897,15 @@ impl App {
         // script" confirmation; otherwise a later [q] would still write it.
         self.generate_script = false;
 
-        self.step = match self.step {
-            Step::IsoPath => Step::IsoPath,
-            Step::Packages => Step::IsoPath,
-            Step::Tweaks => Step::Packages,
-            Step::Custom => Step::Tweaks,
-            Step::Confirm => Step::Custom,
-            Step::Preview => Step::Confirm,
-            Step::Finished => Step::Preview,
-        };
+        let order = self.step_order();
+        let previous = self.step_position(&order).saturating_sub(1);
+        self.step = order[previous];
         self.is_typing = self.step == Step::Custom;
     }
 
     pub fn current_step_number(&self) -> (usize, usize) {
-        let current = match self.step {
-            Step::IsoPath => 1,
-            Step::Packages => 2,
-            Step::Tweaks => 3,
-            Step::Custom => 4,
-            Step::Confirm => 5,
-            Step::Preview => 6,
-            Step::Finished => 7,
-        };
-        (current, 7)
+        let order = self.step_order();
+        (self.step_position(&order) + 1, order.len())
     }
 }
 
@@ -880,5 +968,59 @@ mod tests {
         app.custom[FIELD_HOSTNAME] = "bad host".to_string();
         assert!(!app.validate_custom());
         assert_eq!(app.custom_invalid, Some(FIELD_HOSTNAME));
+    }
+
+    fn app_with_desktops() -> App {
+        let mut app = app_with_iso("/tmp/x.iso");
+        app.desktops = ["KDE-Desktop", "Hyprland"]
+            .iter()
+            .map(|id| DesktopOption {
+                id: id.to_string(),
+                name: id.to_string(),
+                keep: true,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn desktops_step_is_skipped_when_the_iso_offers_none() {
+        let mut app = app_with_iso("/tmp/x.iso");
+        app.step = Step::Packages;
+        app.next_step();
+        assert!(app.step == Step::Tweaks);
+        assert_eq!(app.current_step_number(), (3, 7));
+        app.prev_step();
+        assert!(app.step == Step::Packages);
+    }
+
+    #[test]
+    fn desktops_step_sits_between_packages_and_tweaks() {
+        let mut app = app_with_desktops();
+        app.step = Step::Packages;
+        app.next_step();
+        assert!(app.step == Step::Desktops);
+        assert_eq!(app.current_step_number(), (3, 8));
+        app.next_step();
+        assert!(app.step == Step::Tweaks);
+        app.prev_step();
+        app.prev_step();
+        assert!(app.step == Step::Packages);
+    }
+
+    #[test]
+    fn unchecking_a_desktop_is_toggled_summarized_and_saved_in_presets() {
+        let mut app = app_with_desktops();
+        app.step = Step::Desktops;
+        app.move_cursor(1);
+        app.toggle_selected();
+        assert!(!app.desktops[1].keep);
+        assert_eq!(app.desktops_summary(), "Removing Hyprland");
+        assert!(app.to_preset().contains("drop_desktop=Hyprland"));
+
+        let mut fresh = app_with_desktops();
+        fresh.apply_preset(&app.to_preset());
+        assert!(fresh.desktops[0].keep);
+        assert!(!fresh.desktops[1].keep);
     }
 }

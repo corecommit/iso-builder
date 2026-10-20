@@ -85,7 +85,7 @@ pub fn squashfs_listing(rootfs_image: &str) -> Result<String, String> {
 }
 
 /// Contents of one file inside the image, via `unsquashfs -cat`.
-fn read_file_from_squashfs(rootfs_image: &str, path: &str) -> Result<String, String> {
+pub(super) fn read_file_from_squashfs(rootfs_image: &str, path: &str) -> Result<String, String> {
     run_unsquashfs(&["-cat", rootfs_image, path])
 }
 
@@ -114,7 +114,7 @@ fn unsquashfs_start_error(err: io::Error) -> String {
 /// complete path. `unsquashfs -l` prefixes every entry with
 /// `squashfs-root/`, so a plain suffix match would also accept lookalikes
 /// like `usr/bin/pacman-conf`.
-fn listing_has_path(listing: &str, relative: &str) -> bool {
+pub(super) fn listing_has_path(listing: &str, relative: &str) -> bool {
     let suffix = format!("/{}", relative);
     listing.lines().any(|line| {
         let path = line.trim().trim_end_matches('/');
@@ -154,21 +154,52 @@ const DE_SESSION_FILES: &[(&str, &str)] = &[
     ("hyprland.desktop", "Hyprland"),
     ("plasmawayland.desktop", "KDE Plasma"),
     ("plasma.desktop", "KDE Plasma"),
+    ("plasmax11.desktop", "KDE Plasma"),
     ("gnome.desktop", "GNOME"),
+    ("gnome-xorg.desktop", "GNOME"),
+    ("gnome-wayland.desktop", "GNOME"),
     ("ubuntu.desktop", "GNOME"),
     ("xfce.desktop", "XFCE"),
+    ("xfce-wayland.desktop", "XFCE"),
+    ("cinnamon.desktop", "Cinnamon"),
+    ("cinnamon2d.desktop", "Cinnamon"),
+    ("mate.desktop", "MATE"),
+    ("lxqt.desktop", "LXQt"),
+    ("lxde.desktop", "LXDE"),
+    ("budgie-desktop.desktop", "Budgie"),
+    ("cosmic.desktop", "COSMIC"),
+    ("pantheon.desktop", "Pantheon"),
+    ("deepin.desktop", "Deepin"),
+    ("enlightenment.desktop", "Enlightenment"),
     ("sway.desktop", "Sway"),
+    ("niri.desktop", "niri"),
+    ("river.desktop", "River"),
+    ("i3.desktop", "i3"),
+    ("bspwm.desktop", "bspwm"),
+    ("openbox.desktop", "Openbox"),
+    ("awesome.desktop", "Awesome"),
+    ("qtile.desktop", "Qtile"),
 ];
 
-/// Desktop environment found in the `unsquashfs -l` output. Pure.
+/// Every desktop environment / window manager found in the `unsquashfs -l`
+/// output, in table order, without duplicates (Plasma ships several session
+/// files but is listed once). Pure.
+pub fn desktop_environments_in(listing: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for (file, label) in DE_SESSION_FILES {
+        let present = listing_has_path(listing, &format!("usr/share/wayland-sessions/{}", file))
+            || listing_has_path(listing, &format!("usr/share/xsessions/{}", file));
+        if present && !found.contains(label) {
+            found.push(label);
+        }
+    }
+    found
+}
+
+/// First desktop environment found in the listing (the one shown on the
+/// review screen). Pure.
 pub fn desktop_environment_in(listing: &str) -> Option<&'static str> {
-    DE_SESSION_FILES
-        .iter()
-        .find(|(file, _)| {
-            listing_has_path(listing, &format!("usr/share/wayland-sessions/{}", file))
-                || listing_has_path(listing, &format!("usr/share/xsessions/{}", file))
-        })
-        .map(|(_, label)| *label)
+    desktop_environments_in(listing).into_iter().next()
 }
 
 /// Last non-empty stderr line of a failed tool, for compact error messages.
@@ -256,6 +287,23 @@ mod tests {
             Some("GNOME")
         );
         assert_eq!(desktop_environment_in("squashfs-root/usr/bin/pacman"), None);
+    }
+
+    #[test]
+    fn all_desktops_are_found_once_each() {
+        let listing = [
+            "squashfs-root/usr/share/wayland-sessions/plasma.desktop",
+            "squashfs-root/usr/share/xsessions/plasmax11.desktop",
+            "squashfs-root/usr/share/xsessions/xfce.desktop",
+            "squashfs-root/usr/share/wayland-sessions/hyprland.desktop",
+            "squashfs-root/usr/share/xsessions/xfce.desktop.bak",
+        ]
+        .join("\n");
+        assert_eq!(
+            desktop_environments_in(&listing),
+            vec!["Hyprland", "KDE Plasma", "XFCE"]
+        );
+        assert!(desktop_environments_in("squashfs-root/usr/bin/pacman").is_empty());
     }
 
     #[test]

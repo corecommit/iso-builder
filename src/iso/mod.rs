@@ -9,12 +9,14 @@
 pub mod discovery;
 pub mod extract;
 pub mod inspect;
+pub mod installer;
 pub mod workspace;
 
 use std::fs;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 pub use discovery::{deep_scan_worker, discover_isos, IsoEntry};
+pub use installer::{installer_desktops, DesktopChoice, InstallerDesktops};
 pub use inspect::{
     desktop_environment_in, distro_name_from, parse_distro_name, parse_pkg_mgr_from_listing,
     squashfs_listing,
@@ -51,6 +53,9 @@ pub struct IsoPrep {
     pub pkg_mgr: String,
     /// Desktop session file found in the image or "Unknown".
     pub desktop: String,
+    /// Every desktop the distro's installer offers (empty when the installer
+    /// is unsupported); `desktop` above is only the one installed in the image.
+    pub desktops: InstallerDesktops,
     /// True when the cached `rootfs.sfs` from an earlier run was reused.
     pub reused: bool,
 }
@@ -109,6 +114,7 @@ where
         desktop: desktop_environment_in(&listing)
             .unwrap_or("Unknown")
             .to_string(),
+        desktops: installer_desktops(&rootfs_image, &listing),
         reused,
     })
 }

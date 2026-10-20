@@ -33,6 +33,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
     let step_name = match app.step {
         Step::IsoPath => "Original ISO File",
         Step::Packages => "Extra Packages",
+        Step::Desktops => "Installer Desktops",
         Step::Tweaks => "System Tweaks",
         Step::Custom => "Custom Additions",
         Step::Confirm => "Review & Generate",
@@ -99,6 +100,23 @@ pub fn ui(frame: &mut Frame, app: &App) {
                 detected
             );
             draw_checklist(frame, chunks[1], &title, &rows, app.package_cursor);
+        }
+        Step::Desktops => {
+            let rows: Vec<CheckRow> = app
+                .desktops
+                .iter()
+                .map(|d| CheckRow {
+                    text: format!("{:<20} - {}", d.id, d.name),
+                    selected: d.keep,
+                })
+                .collect();
+            let kept = app.desktops.iter().filter(|d| d.keep).count();
+            let title = format!(
+                " Installer Desktops - {} of {} kept (uncheck to remove from the installer) ",
+                kept,
+                app.desktops.len()
+            );
+            draw_checklist(frame, chunks[1], &title, &rows, app.desktop_cursor);
         }
         Step::Tweaks => {
             let rows: Vec<CheckRow> = app
@@ -169,12 +187,13 @@ pub fn ui(frame: &mut Frame, app: &App) {
                 }
             };
             let mut summary = format!(
-                "Original ISO: {}\nDetected: {} | {} | {}\nPackages: {}\nSystem Tweaks: {}\nExtra packages: {}\nCustom command: {}\nHostname: {} | Output ISO: {}\nTools: {}\n",
+                "Original ISO: {}\nDetected: {} | {} | {}\nPackages: {}\nInstaller desktops: {}\nSystem Tweaks: {}\nExtra packages: {}\nCustom command: {}\nHostname: {} | Output ISO: {}\nTools: {}\n",
                 app.iso_path,
                 app.distro_name,
                 app.desktop,
                 app.pkg_mgr,
                 app.packages_summary(),
+                app.desktops_summary(),
                 app.tweaks_summary(),
                 or_none(&app.custom[FIELD_PACKAGES]),
                 or_none(app.custom_command()),
@@ -280,7 +299,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
             Step::Confirm => {
                 " [Enter] Build & Preview | [s] Save preset | [Esc] back | [q]/[Ctrl+C] quit "
             }
-            Step::Packages | Step::Tweaks => {
+            Step::Packages | Step::Desktops | Step::Tweaks => {
                 " [j/k or Up/Down] move | [Space] toggle | [Enter] continue | [Esc] back | [q] quit "
             }
             Step::Custom => {

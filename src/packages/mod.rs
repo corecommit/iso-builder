@@ -9,6 +9,35 @@ pub const PKG_MANAGERS: [&str; 7] = ["pacman", "apt", "dnf", "zypper", "xbps", "
 /// `[SKIP]` line instead of guessing a name that does not exist.
 pub type PkgIds = &'static [(&'static str, &'static str)];
 
+/// A desktop environment that can be installed into the target root filesystem.
+/// Package names are intentionally explicit per package manager; unsupported
+/// combinations are reported rather than guessed.
+pub struct DesktopOption {
+    pub name: &'static str,
+    pub key: &'static str,
+    pub desc: &'static str,
+    pub ids: PkgIds,
+    pub selected: bool,
+}
+
+impl DesktopOption {
+    pub fn id_for(&self, pkg_mgr: &str) -> Option<&'static str> {
+        self.ids.iter().find(|(mgr, _)| *mgr == pkg_mgr).map(|(_, id)| *id)
+    }
+}
+
+pub fn default_desktops() -> Vec<DesktopOption> {
+    vec![
+        DesktopOption { name: "Keep current default", key: "keep", desc: "Do not install or change the default session", ids: &[], selected: true },
+        DesktopOption { name: "GNOME", key: "gnome", desc: "Modern, streamlined desktop", ids: &[("pacman", "gnome"), ("apt", "gnome-shell gnome-session"), ("dnf", "@gnome-desktop"), ("zypper", "patterns-gnome-gnome"), ("xbps", "gnome")], selected: false },
+        DesktopOption { name: "KDE Plasma", key: "plasma", desc: "Feature-rich and highly customizable", ids: &[("pacman", "plasma-meta"), ("apt", "kde-standard"), ("dnf", "@kde-desktop-environment"), ("zypper", "patterns-kde-kde_plasma"), ("xbps", "kde5")], selected: false },
+        DesktopOption { name: "Xfce", key: "xfce", desc: "Lightweight and familiar", ids: &[("pacman", "xfce4 xfce4-goodies"), ("apt", "xfce4"), ("dnf", "@xfce-desktop"), ("zypper", "patterns-xfce-xfce"), ("xbps", "xfce4")], selected: false },
+        DesktopOption { name: "Cinnamon", key: "cinnamon", desc: "Traditional desktop layout", ids: &[("pacman", "cinnamon"), ("apt", "cinnamon-desktop-environment"), ("dnf", "@cinnamon-desktop"), ("zypper", "patterns-cinnamon-cinnamon"), ("xbps", "cinnamon")], selected: false },
+        DesktopOption { name: "MATE", key: "mate", desc: "Classic, lightweight desktop", ids: &[("pacman", "mate mate-extra"), ("apt", "mate-desktop-environment"), ("dnf", "@mate-desktop"), ("zypper", "patterns-mate-mate"), ("xbps", "mate")], selected: false },
+        DesktopOption { name: "LXQt", key: "lxqt", desc: "Lightweight Qt-based desktop", ids: &[("pacman", "lxqt"), ("apt", "lxqt"), ("dnf", "@lxqt-desktop"), ("zypper", "patterns-lxqt-lxqt"), ("xbps", "lxqt")], selected: false },
+    ]
+}
+
 pub struct PackageOption {
     pub name: &'static str,
     pub desc: &'static str,
